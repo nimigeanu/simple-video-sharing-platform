@@ -1,0 +1,413 @@
+Description: Simple VOD architecture with Adaptive Bitrate transcoding and CDN delivery
+
+Parameters:
+
+  NotificationEmail:
+    Description: Email address for SNS notifications.
+    Type: String
+    AllowedPattern: "^[_A-Za-z0-9-\\+]+(\\.[_A-Za-z0-9-]+)*@[A-Za-z0-9-]+(\\.[A-Za-z0-9]+)*(\\.[A-Za-z]{2,})$"
+
+Resources:
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        -
+          PolicyName: !Sub "${AWS::StackName}-LambdaRolePolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Join ["", ["arn:aws:iam::", Ref: "AWS::AccountId", ":role/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Join ["", ["arn:aws:logs:", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":log-group:/aws/lambda/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - mediaconvert:DescribeEndpoints
+                  - mediaconvert:CreateJob
+                Resource:
+                  - !Join ["", ["arn:aws:mediaconvert:", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":*"]]
+
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "mediaconvert.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      Policies:
+        -
+          PolicyName: !Sub "${AWS::StackName}-MediaConvertRolePolicy"
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-sourcebucket-${UniqueId.ID}/*"
+                  - !Sub "${DestinationBucket.Arn}/*"
+              -
+                Effect: Allow
+                Action:
+                  - "execute-api:Invoke"
+                Resource:
+                  - !Join ["", ["arn:aws:execute-api:", Ref: "AWS::Region", ":", Ref: "AWS::AccountId", ":*"]]
+
+  
+
+  BucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref StartTranscodeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub arn:aws:s3:::${AWS::StackName}-sourcebucket-${UniqueId.ID}
+
+  SourceBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-sourcebucket-${UniqueId.ID}
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Function: !GetAtt StartTranscodeFunction.Arn
+      LifecycleConfiguration:
+        Rules:
+          -
+            Id: !Sub ${AWS::StackName}-sourcebucket-archive
+            TagFilters:
+              -
+                Key: !Sub ${AWS::StackName}
+                Value: archive
+            Status: Enabled
+            Transitions:
+            - TransitionInDays: 1
+              StorageClass: Glacier
+
+  DestinationBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3-access/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  LogsBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: LogDeliveryWrite
+
+  DestinationBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - "s3:GetObject"
+            Effect: "Allow"
+            Resource: !Join ["", ["arn:aws:s3:::", Ref: "DestinationBucket", "/*"]]
+            Principal:
+              CanonicalUser: !GetAtt DestinationOriginAccessIdentity.S3CanonicalUserId
+
+  SnsPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: !Sub ${AWS::StackName}-TopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: !Sub ${AWS::StackName}-TopicPolicyStatement
+          Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sns:Publish
+          Resource: "*"
+      Topics:
+        - !Ref EncodeCompleteSnsTopic
+        - !Ref EncodeFailedSnsTopic
+
+  EncodeCompleteSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${AWS::StackName}-EncodeCompleteNotification
+      Subscription:
+        -
+          Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  EncodeFailedSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${AWS::StackName}-EncodeFailedNotification
+      Subscription:
+        -
+          Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  EncodeCompleteRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-EncodeComplete
+      Description: MediaConvert Completed jobs event rule
+      EventPattern:
+        source:
+          - aws.mediaconvert
+        detail:
+          status:
+            - COMPLETE
+      Targets:
+        -
+          Arn: 
+            Ref: "EncodeCompleteSnsTopic"
+          Id: !Sub ${AWS::StackName}-EncodeComplete
+
+  EncodeErrorRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-EncodeError
+      Description: MediaConvert Error event rule
+      EventPattern:
+        source:
+          - aws.mediaconvert
+        detail:
+          status:
+            - ERROR
+      Targets:
+        -
+          Arn: 
+            Ref: "EncodeFailedSnsTopic"
+          Id: !Sub ${AWS::StackName}-EncodeError
+
+  MediaConvertEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-MediaConvertEndPoint
+      Description: Finds and returns the MediaConvert endpoint 
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          var response = require('cfn-response');
+          const AWS = require('aws-sdk');
+
+          exports.handler = (event, context) => {
+            console.log('REQUEST:: ', JSON.stringify(event, null, 2));
+            const mediaconvert = new AWS.MediaConvert();
+            mediaconvert.describeEndpoints().promise()
+            .then((data) => {
+              var responseData = {
+                EndpointUrl: data.Endpoints[0].Url,
+              };
+              console.log("responseData: ", responseData);
+              response.send(event, context, response.SUCCESS, responseData);
+            })
+            .catch((err) => {
+              console.log('ERROR:: ', err, err.stack);
+              response.send(event, context, 'FAILED');
+            });
+          };
+
+      Runtime:  nodejs8.10
+      Timeout: 180
+
+  MediaConvertEndPoint:
+    Type: "Custom::LoadLambda"
+    Properties:
+      ServiceToken: !GetAtt MediaConvertEndpointFunction.Arn
+      Resource: "EndPoint"
+
+  UniqueIdFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-UniqueId
+      Description: Generates an stack-specific unique ID to use for bucket naming and other purposes
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          var response = require('cfn-response');
+
+          exports.handler = (event, context) => {
+            console.log('REQUEST:: ', JSON.stringify(event, null, 2));
+            var responseData = {
+              ID: Math.random().toString(36).substring(7) + new Date().getTime().toString(36)
+            };
+            console.log("responseData: ", responseData);
+            response.send(event, context, response.SUCCESS, responseData);
+          };
+
+      Runtime:  nodejs8.10
+      Timeout: 30
+
+  UniqueId:
+    Type: "Custom::LoadLambda"
+    Properties:
+      ServiceToken: !GetAtt UniqueIdFunction.Arn
+      Resource: "EndPoint"
+
+  StartTranscodeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-StartTranscode
+      Description: Initiates transcoding of item by MediaConvert
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Timeout: 180
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+
+          const MEDIA_CONVERT_ENDPOINT = process.env.MEDIA_CONVERT_ENDPOINT;
+          const MEDIA_CONVERT_ROLE_ARN = process.env.MEDIA_CONVERT_ROLE_ARN;
+          const JOB_TEMPLATE = process.env.JOB_TEMPLATE;
+          const OUTPUT_LOCATION = `s3://${process.env.OUTPUT_LOCATION}/`;
+
+          const mediaConvert = new AWS.MediaConvert({endpoint: MEDIA_CONVERT_ENDPOINT});
+
+          exports.handler = function(event, context, callback) {
+            const srcBucket = event.Records[0].s3.bucket.name;
+            const srcKey = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+            const fileInput = `s3://${srcBucket}/${srcKey}`;
+            
+
+            const params = {
+              JobTemplate: JOB_TEMPLATE,
+              Role: MEDIA_CONVERT_ROLE_ARN,
+              Settings: {
+                Inputs: [
+                  {
+                    FileInput: fileInput,
+                    "AudioSelectors": {
+                      "Audio Selector 1": {
+                        "Offset": 0,
+                        "DefaultSelection": "DEFAULT",
+                        "SelectorType": "LANGUAGE_CODE",
+                        "ProgramSelection": 1,
+                        "LanguageCode": "ENM"
+                      }
+                    },
+                  },
+                ],
+              },
+            };
+
+            if (OUTPUT_LOCATION) {
+              params.Settings.OutputGroups = [
+                {
+                  Outputs: [],
+                  OutputGroupSettings: {
+                    "Type": "CMAF_GROUP_SETTINGS",
+                    "CmafGroupSettings": {
+                      "SegmentLength": 10,
+                      "Destination": OUTPUT_LOCATION,
+                      "FragmentLength": 2,
+                    }
+                  },
+                },
+              ];
+            }
+
+            mediaConvert.createJob(params).promise()
+            .then(() => {
+              let message = 'Transcode job created.';
+              console.log(message);
+              callback(null, message);
+            })
+            .catch((err) => {
+              let message = `Transcode failed for s3://${srcBucket}/${srcKey} Error: ${err}`;
+              console.error(message);
+              callback(null, message);
+            });
+          };
+      Environment:
+        Variables:
+          MEDIA_CONVERT_ENDPOINT: !GetAtt MediaConvertEndPoint.EndpointUrl
+          MEDIA_CONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
+          JOB_TEMPLATE: System-Ott_Cmaf_Cmfc_Avc_Aac_Sdr_Qvbr
+          OUTPUT_LOCATION: !Ref DestinationBucket
+
+  DestinationOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "access-identity-${DestinationBucket}"
+
+  CloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub "${DestinationBucket}.s3.${AWS::Region}.amazonaws.com"
+            Id: defaultS3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${DestinationOriginAccessIdentity}"
+        Enabled: 'true'
+        Logging:
+          IncludeCookies: 'false'
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: cloudfront-logs/
+        DefaultCacheBehavior:
+          AllowedMethods:
+          - GET
+          - HEAD
+          - OPTIONS
+          TargetOriginId: defaultS3Origin
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+            Headers:
+              - Origin
+              - Access-Control-Request-Method
+              - Access-Control-Request-Headers
+          ViewerProtocolPolicy: allow-all
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: 'true'
+
+Outputs:
+  CloudFrontDistributionDNSName:
+    Description: The DNSName of the CF Distribution, use to create playback URLs
+    Value: !GetAtt CloudFrontDistribution.DomainName
