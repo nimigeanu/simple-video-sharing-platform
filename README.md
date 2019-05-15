@@ -18,7 +18,7 @@ Built as streaming backbone for a video sharing platform with loads of user cont
 
 1. Sign in to the [AWS Management Console](https://aws.amazon.com/console), then click the button below to launch the CloudFormation template. Alternatively you can [download](template.yaml) the template and adjust it to your needs.
 
-[![Launch Stack](https://gitcdn.xyz/repo/buildkite/cloudformation-launch-stack-button-svg/master/launch-stack.svg)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?stackName=simple-video-sharing-platform&templateURL=https://s3.amazonaws.com/lostshadow/simple-video-sharing-platform/template.yaml)
+[![Launch Stack](https://cdn.rawgit.com/buildkite/cloudformation-launch-stack-button-svg/master/launch-stack.svg)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?stackName=simple-video-sharing-platform&templateURL=https://s3.amazonaws.com/lostshadow/simple-video-sharing-platform/template.yaml)
 
 2. Be sure to fill in your email address under `NotificationEmail`. This will be used for testing transcoding notifications.
 3. Check the `I acknowledge that AWS CloudFormation might create IAM resources` box. This confirms you agree to have some required IAM roles and policies created by *CloudFormation*.
